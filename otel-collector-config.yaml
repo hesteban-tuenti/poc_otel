@@ -1,0 +1,47 @@
+# OpenTelemetry Collector configuration
+#
+# Receives OTLP/HTTP from both Python services on port 4318 (mapped to host
+# 4319 in docker-compose to avoid clashing with the LGTM container).
+# Forwards all three signal pipelines to the grafana/otel-lgtm container.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318   # services send here; exposed as host:4319
+
+processors:
+  # Buffers telemetry before export to reduce network calls
+  batch:
+
+  # Prevents the Collector from running out of memory under load
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+
+exporters:
+  # Forwards to the grafana/otel-lgtm container over the Docker network
+  otlphttp/grafana:
+    endpoint: http://lgtm:4318
+    tls:
+      insecure: true
+
+  # Prints a one-line summary per batch to Collector stdout — useful to confirm
+  # data is flowing without reading full payloads
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [otlphttp/grafana, debug]
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [otlphttp/grafana, debug]
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [otlphttp/grafana, debug]

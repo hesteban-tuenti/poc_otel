@@ -1,0 +1,26 @@
+services:
+
+  # grafana/otel-lgtm bundles Grafana, Tempo (traces), Loki (logs), and a
+  # Prometheus-compatible metrics store in a single image. It exposes an
+  # OTLP/HTTP receiver on port 4318 that the Collector forwards to.
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000"   # Grafana UI  →  http://localhost:3000
+      - "4318:4318"   # OTLP/HTTP   ←  otel-collector writes here (internal)
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+
+  # The OTel Collector is the single ingestion point for all services.
+  # Services send OTLP/HTTP to localhost:4319; the Collector fans it out to the
+  # LGTM backend. Swapping backends means only changing this config — the
+  # Python services are untouched.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - "4319:4318"   # host:4319 → container:4318 (host 4318 is taken by lgtm)
+    depends_on:
+      - lgtm
