@@ -1,6 +1,6 @@
-# CLAUDE.md
+# Development Guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Instructions for running, developing, and understanding this OpenTelemetry POC.
 
 ## Running the POC
 
@@ -32,7 +32,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4319 uv run python sending_server.p
 curl http://127.0.0.1:5002/
 ```
 
-Grafana is at `http://localhost:3000` — see `FLOW.md` for what to check per signal.
+Grafana is at `http://localhost:3000` — see `README.md` for what to check per signal.
 
 **Debug mode** (prints spans to terminal without needing a running backend):
 
@@ -63,4 +63,4 @@ sender-service (5002) ──HTTP──▶ receiver-service (5001)
 
 **`receiver_server.py`** — extracts the propagation headers, reconstructs trace context, starts a child span linked to the sender's span, records counters and histograms.
 
-See `FLOW.md` for the full OTel component map, per-signal flow diagrams, and Grafana verification steps.
+See `README.md` for the full OTel component map, per-signal flow diagrams, and Grafana verification steps.
