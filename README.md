@@ -110,6 +110,61 @@ No application code change is needed for correlation. As long as `logger.info(..
 
 ---
 
+## Process Boundaries — What Runs Where
+
+There are three separate processes involved. Understanding which OTel components live in each is important because two of them have a component called "batch processor" that are completely independent.
+
+### Inside each Python service (sender-service, receiver-service)
+
+All of the following run **in-process**, as background threads of the Flask app:
+
+| Component | Runs as | Role |
+|---|---|---|
+| `TracerProvider` / `MeterProvider` / `LoggerProvider` | In-process object | Factories; hold processors and the resource |
+| `BatchSpanProcessor` | Background thread | Buffers finished spans, flushes to exporter |
+| `BatchLogRecordProcessor` | Background thread | Buffers log records, flushes to exporter |
+| `PeriodicExportingMetricReader` | Background thread | Wakes every 10s, collects metric values, pushes to exporter |
+| `OTLPSpanExporter` / `OTLPMetricExporter` / `OTLPLogExporter` | In-process | Makes HTTP POST to the Collector |
+| `CompositePropagator` | In-process, at request time | `inject`/`extract` on business HTTP headers |
+| `LoggingHandler` | In-process, at log-call time | Reads active span, stamps `trace_id`/`span_id` onto log records |
+
+### Inside the OTel Collector (separate Go process / Docker container)
+
+A completely separate process — nothing to do with the Python SDK:
+
+| Component | Role |
+|---|---|
+| `otlp` receiver | Listens on `:4318`, accepts OTLP/HTTP POSTs from services |
+| `memory_limiter` processor | Drops data if memory pressure is too high |
+| `batch` processor | Re-batches before forwarding to reduce connections to backend |
+| `otlphttp/grafana` exporter | Forwards to LGTM container on `:4318` (internal Docker network) |
+| `debug` exporter | Prints summary lines to Collector stdout |
+
+### Inside the LGTM container (separate Docker container)
+
+| Component | Stores / serves |
+|---|---|
+| Tempo | Traces |
+| Loki | Logs |
+| Prometheus | Metrics |
+| Grafana | Unified query UI on `:3000` |
+
+### The two batch processors are independent
+
+The naming overlap is a common source of confusion:
+
+```
+[service process — Python]              [Collector process — Go]
+BatchSpanProcessor ──OTLP/HTTP──▶  batch processor ──OTLP/HTTP──▶  Tempo
+(SDK, in-process)                   (Collector config)
+buffers spans inside the app         re-batches for the backend
+before the network hop               before the second network hop
+```
+
+Both buffer data to avoid blocking on network I/O, but they operate at different hops and are configured independently.
+
+---
+
 ## Signal Flow Per Pillar
 
 ### Traces
@@ -340,6 +395,24 @@ Open `http://localhost:3000` (no login required — anonymous access is enabled)
 **Why 10-second metric export interval?**
 The default is 60 seconds. For a POC demo, 10 seconds means you see counter changes in Grafana quickly without waiting a minute. In production, 60 seconds is more appropriate.
 
+**What does OTLP/HTTP mean?**
+"OTLP/HTTP" stacks two things — the data format and the transport:
+
+```
+OTLP  /  HTTP
+ │         └─ transport: plain HTTP/1.1 POST requests
+ └─ data format: OpenTelemetry Protocol, serialized as Protocol Buffers (protobuf)
+```
+
+OTLP defines the data model (what fields a span, metric, or log record must have), the binary encoding (protobuf), and the endpoint paths (`/v1/traces`, `/v1/metrics`, `/v1/logs`). "HTTP" is just the transport layer. It is not "plain HTTP" — the body is binary protobuf, not JSON or form data. The alternative transport is OTLP/gRPC, which uses the same protobuf encoding over gRPC (HTTP/2) instead.
+
+| | OTLP/HTTP | OTLP/gRPC |
+|---|---|---|
+| Transport | HTTP/1.1 POST | gRPC (HTTP/2) |
+| Encoding | Protobuf (default) or JSON | Protobuf only |
+| Port convention | 4318 | 4317 |
+| Needs C extension | No | Yes (`grpcio`) |
+
 **Why OTLP/HTTP instead of OTLP/gRPC?**
 HTTP/protobuf requires no C-extension (`grpcio`), installs faster with `uv`, and works through any load balancer or proxy without HTTP/2 negotiation. The Collector accepts both; OTLP/HTTP is the lower-friction choice for local development.
 
@@ -354,6 +427,33 @@ Flask normalises incoming HTTP headers to title-case (`Traceparent`, `Baggage`).
 
 **Why do logs inside sub-spans have a different `span_id` than the parent span?**
 `LoggingHandler` calls `trace.get_current_span()` at the moment `logger.info(...)` is called. Inside `validate_request` or `process_data`, the active span is the sub-span — so the log record is stamped with the sub-span's `span_id`, not `handle_request`'s. All logs from the same request share the same `trace_id`, but you can filter by `span_id` in Loki to see only what happened inside a specific operation.
+
+**How the Collector routes signals to different backends**
+The endpoint path the SDK posts to is the routing key — the Collector reads it and directs the payload into the matching pipeline, without inspecting the protobuf body:
+
+```
+SDK (Python process)
+  OTLPSpanExporter   POST :4319/v1/traces  ─┐
+  OTLPMetricExporter POST :4319/v1/metrics  ├─▶ Collector OTLP receiver (reads endpoint path)
+  OTLPLogExporter    POST :4319/v1/logs    ─┘         │
+                                                       │  routes by signal type into pipeline
+                                                       ▼
+                                            otel-collector-config.yaml
+                                            pipelines:
+                                              traces:  receivers[otlp] → processors → exporters
+                                              metrics: receivers[otlp] → processors → exporters
+                                              logs:    receivers[otlp] → processors → exporters
+                                                       │
+                                            otlphttp/grafana exporter
+                                                       │
+                          ┌────────────────────────────┼────────────────────────────┐
+                          ▼                            ▼                            ▼
+               POST :4318/v1/traces        POST :4318/v1/metrics        POST :4318/v1/logs
+                          │                            │                            │
+                        Tempo                    Prometheus                       Loki
+```
+
+The pipeline config in `otel-collector-config.yaml` is also where you control which backends receive which signals. To send traces to Jaeger instead of Tempo, add a `jaeger` exporter to the `traces` pipeline only — metrics and logs are unaffected and no Python code changes.
 
 **Swapping backends**
 Because all services talk only to the OTel Collector, replacing the backend requires only changing the `exporters` block in `otel-collector-config.yaml` and restarting the Collector container. The Python code is unchanged. To evaluate Jaeger instead of Tempo, add a `jaeger` exporter to the Collector config and point a Grafana datasource at it.
