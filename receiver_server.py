@@ -1,6 +1,9 @@
+import time
+
 from flask import Flask, request
-from opentelemetry import baggage
+from opentelemetry import baggage, trace
 from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.trace import StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 
@@ -74,6 +77,43 @@ def hello():
                 "baggage.env": env,
             },
         )
+
+        # ── Sub-spans with events and status ─────────────────────────────────
+        # Decorated inner functions inherit the active handle_request span as
+        # parent automatically — no context= arg needed here, only at service
+        # entry points where context crosses a process boundary.
+
+        @tracer.start_as_current_span("validate_request")
+        def validate_request():
+            s = trace.get_current_span()
+            is_valid = bool(user_id and env)
+            s.add_event(
+                "validation.complete",
+                attributes={
+                    "user_id_present": bool(user_id),
+                    "env_present":     bool(env),
+                    "valid":           is_valid,
+                },
+            )
+            s.set_status(
+                StatusCode.OK if is_valid else StatusCode.ERROR,
+                description="" if is_valid else "Missing required baggage",
+            )
+            logger.info("Validation result: valid=%s", is_valid)
+            return is_valid
+
+        @tracer.start_as_current_span("process_data")
+        def process_data():
+            s = trace.get_current_span()
+            s.add_event("cache.miss", attributes={"cache.key": f"user:{user_id or 'unknown'}"})
+            logger.info("Cache miss — processing from source")
+            time.sleep(0.01)
+            s.add_event("processing.done", attributes={"result.size": 42})
+            logger.info("Processing complete")
+            s.set_status(StatusCode.OK)
+
+        validate_request()
+        process_data()
 
         # ── Record metrics ────────────────────────────────────────────────────
         baggage_count = sum(1 for v in [user_id, env] if v)

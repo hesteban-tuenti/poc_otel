@@ -61,6 +61,19 @@ sender-service (5002) ──HTTP──▶ receiver-service (5001)
 
 **`sending_server.py`** — creates a root span, sets W3C baggage, injects `traceparent` + `baggage` headers into the outbound HTTP call, records request counter + latency histogram.
 
-**`receiver_server.py`** — extracts the propagation headers, reconstructs trace context, starts a child span linked to the sender's span, records counters and histograms.
+**`receiver_server.py`** — extracts the propagation headers, reconstructs trace context, starts a child span linked to the sender's span, records counters and histograms. Within that child span it defines two decorated inner functions that each become a grandchild sub-span:
+
+- `validate_request` — checks that expected baggage values are present; adds a `validation.complete` span event with boolean attributes; sets `StatusCode.OK` or `StatusCode.ERROR` depending on the result.
+- `process_data` — simulates a cache miss and I/O delay; adds `cache.miss` and `processing.done` span events; sets `StatusCode.OK`.
+
+Both use `@tracer.start_as_current_span` as a **decorator** (rather than a `with` block). The span is created when the function is called and closed automatically when it returns. Inside each function, `trace.get_current_span()` is used to access the active sub-span, since the decorator form does not expose a span reference via `as`. Each function also emits log records via `logger.info(...)` — because `LoggingHandler` reads the active span at call time, those log lines are stamped with the sub-span's `span_id`, not the parent `handle_request` span's.
+
+The resulting trace has four spans under one `trace_id`:
+```
+sender:handle_request
+  └─ receiver:handle_request
+       ├─ receiver:validate_request  (events: validation.complete)
+       └─ receiver:process_data      (events: cache.miss, processing.done)
+```
 
 See `README.md` for the full OTel component map, per-signal flow diagrams, and Grafana verification steps.

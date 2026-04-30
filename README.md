@@ -23,12 +23,12 @@ curl
 sender-service (port 5002)                receiver-service (port 5001)
  │  creates root span                       │  extracts traceparent + baggage
  │  sets baggage                            │  creates child span (same trace_id)
- │  injects traceparent + baggage headers   │  records metrics
- │  records metrics                         │  logs with trace_id stamped
- │  logs with trace_id stamped              │
+ │  injects traceparent + baggage headers   │  creates sub-spans with events + status
+ │  records metrics                         │  records metrics
+ │  logs with trace_id stamped              │  logs with span_id of the active sub-span
  └──── HTTP GET with propagation headers ───┘
  │                                          │
- │  OTLP/HTTP → localhost:4319             │  OTLP/HTTP → localhost:4319
+ │  OTLP/HTTP → localhost:4319              │  OTLP/HTTP → localhost:4319
  └──────────────────┬───────────────────────┘
                     ▼
           OTel Collector (host:4319)
@@ -115,20 +115,40 @@ No application code change is needed for correlation. As long as `logger.info(..
 ### Traces
 
 ```
-tracer.start_as_current_span("handle_request")
+tracer.start_as_current_span("handle_request")           ← sender, creates root span
   └─ SDK creates Span with: trace_id, span_id, start_time, attributes
        └─ Span is stored in the OTel context (thread-local)
-            └─ (sender) propagator.inject(headers) writes traceparent header
-            └─ (receiver) propagator.extract(carrier) reconstructs ctx
-                 └─ start_as_current_span(..., context=ctx) creates child span
-                      └─ child span's parent_span_id = sender's span_id
-  └─ `with` block exits → span is "finished" (end_time recorded)
-       └─ BatchSpanProcessor receives finished span
-            └─ OTLPSpanExporter POSTs to /v1/traces
-                 └─ Collector forwards to lgtm:4318
-                      └─ Tempo stores the span
-                           └─ Grafana Explore → Tempo → visible as a trace tree
+            └─ propagator.inject(headers) writes traceparent header
+                 └─ HTTP GET to receiver-service
+                      └─ propagator.extract(carrier) reconstructs ctx
+                           └─ start_as_current_span("handle_request", context=ctx)
+                                └─ child span: same trace_id, parent_span_id = sender's span_id
+
+                                     └─ @tracer.start_as_current_span("validate_request")
+                                          └─ grandchild span, parent = handle_request
+                                               └─ span.add_event("validation.complete", {...})
+                                               └─ span.set_status(StatusCode.OK | ERROR)
+                                               └─ closed automatically when function returns
+
+                                     └─ @tracer.start_as_current_span("process_data")
+                                          └─ grandchild span, parent = handle_request
+                                               └─ span.add_event("cache.miss", {...})
+                                               └─ span.add_event("processing.done", {...})
+                                               └─ span.set_status(StatusCode.OK)
+                                               └─ closed automatically when function returns
+
+  └─ each span closes → BatchSpanProcessor receives it
+       └─ OTLPSpanExporter POSTs to /v1/traces
+            └─ Collector forwards to lgtm:4318
+                 └─ Tempo stores all 4 spans under the same trace_id
+                      └─ Grafana Explore → Tempo → 3-level waterfall
 ```
+
+**Span events** are timestamped annotations attached to a span — think of them as structured log entries scoped to a specific operation. They appear in Tempo's Events tab when you click a span.
+
+**Span status** (`StatusCode.OK` / `StatusCode.ERROR`) is a machine-readable outcome separate from span attributes. Backends use it to mark failed spans in red in the waterfall view.
+
+**Decorator vs context manager:** `@tracer.start_as_current_span` is the decorator form of the same API. The span inherits its parent from the active context (thread-local) automatically — no `context=` arg needed. `context=ctx` is only required at service entry points where context crosses a process boundary via `propagator.extract()`.
 
 ### Metrics
 
@@ -230,16 +250,16 @@ The 12 metrics / 13 data points are a combination of the SDK's internal instrume
 otel-collector-1  | 2026-04-29T08:33:10.102Z  info  Traces  {
     "otelcol.signal": "traces",
     "resource spans": 2,
-    "spans": 2
+    "spans": 4
 }
 otel-collector-1  | 2026-04-29T08:33:10.215Z  info  Logs  {
     "otelcol.signal": "logs",
     "resource logs": 2,
-    "log records": 4
+    "log records": 6
 }
 ```
 
-`resource spans: 2` means one resource (each service) contributed spans. `spans: 2` is the total — one from the sender, one from the receiver. `log records: 4` is the total log lines emitted across both services during the request.
+`resource spans: 2` means one resource (each service) contributed spans. `spans: 4` is the total: `sender:handle_request` + `receiver:handle_request` + `receiver:validate_request` + `receiver:process_data`. `log records: 6`: 2 from sender, 1 from receiver's handle_request, 1 from validate_request, 2 from process_data.
 
 ### Why metrics appear constantly but traces/logs only on request
 
@@ -273,8 +293,11 @@ Open `http://localhost:3000` (no login required — anonymous access is enabled)
 4. Click a trace → expand the waterfall
 
 **What to verify:**
-- Two spans appear in the same trace (one per service)
-- The receiver span's `parent_span_id` equals the sender span's `span_id`
+- Four spans appear in the same trace: `sender:handle_request` → `receiver:handle_request` → `receiver:validate_request` + `receiver:process_data`
+- The receiver's `handle_request` span's `parent_span_id` equals the sender span's `span_id`
+- Click `validate_request` → **Events** tab → `validation.complete` event with `user_id_present`, `env_present`, `valid` attributes
+- Click `process_data` → **Events** tab → `cache.miss` and `processing.done` events
+- `validate_request` shows `StatusCode=OK`; to see `ERROR`, remove baggage from `sending_server.py` and retry
 - Span attributes (`http.method`, `peer.service`, `baggage.user_id`, etc.) are visible on each span
 
 ### Metrics → Grafana Explore → datasource: Prometheus
@@ -322,6 +345,15 @@ HTTP/protobuf requires no C-extension (`grpcio`), installs faster with `uv`, and
 
 **Why does the receiver lowercase header keys?**
 Flask normalises incoming HTTP headers to title-case (`Traceparent`, `Baggage`). The W3C propagator spec mandates lowercase keys when extracting. The one-liner `{k.lower(): v for k, v in request.headers.items()}` fixes the mismatch.
+
+**What are span events?**
+`span.add_event(name, attributes={...})` records a timestamped annotation on the span — a discrete moment in time with structured data, but not a separate span. Unlike spans, events have no duration. They are useful for marking cache hits/misses, retries, checkpoints, or any point of interest during an operation. They appear in Tempo under the **Events** tab when you click a span.
+
+**What is span status?**
+`span.set_status(StatusCode.OK | StatusCode.ERROR, description="...")` sets a machine-readable outcome on the span. The default is `StatusCode.UNSET`, which backends treat as "no error" but it is distinct from an explicit `OK`. Setting `ERROR` causes Tempo to highlight the span in red and enables alerting rules based on error rate. If an exception propagates through a `start_as_current_span` block, the status is set to `ERROR` automatically (controlled by the `set_status_on_exception=True` default).
+
+**Why do logs inside sub-spans have a different `span_id` than the parent span?**
+`LoggingHandler` calls `trace.get_current_span()` at the moment `logger.info(...)` is called. Inside `validate_request` or `process_data`, the active span is the sub-span — so the log record is stamped with the sub-span's `span_id`, not `handle_request`'s. All logs from the same request share the same `trace_id`, but you can filter by `span_id` in Loki to see only what happened inside a specific operation.
 
 **Swapping backends**
 Because all services talk only to the OTel Collector, replacing the backend requires only changing the `exporters` block in `otel-collector-config.yaml` and restarting the Collector container. The Python code is unchanged. To evaluate Jaeger instead of Tempo, add a `jaeger` exporter to the Collector config and point a Grafana datasource at it.
